@@ -104,10 +104,11 @@ type CreateGuildChannelRequest struct {
 }
 
 type UpdateChannelRequest struct {
-	Name            *string `json:"name,omitempty"`
-	ParentID        *string `json:"parent_id,omitempty"`
-	Position        *int    `json:"position,omitempty"`
-	LockPermissions *bool   `json:"lock_permissions,omitempty"`
+	Name                 *string                `json:"name,omitempty"`
+	ParentID             *string                `json:"parent_id,omitempty"`
+	Position             *int                   `json:"position,omitempty"`
+	LockPermissions      *bool                  `json:"lock_permissions,omitempty"`
+	PermissionOverwrites *[]PermissionOverwrite `json:"permission_overwrites,omitempty"`
 }
 
 func (client *DiscordClient) GetCurrentUser(ctx context.Context) (DiscordUser, error) {

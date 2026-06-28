@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -17,15 +18,16 @@ type channelPlan struct {
 }
 
 type channelPlanOperation struct {
-	Op                   string                           `json:"op"`
-	Name                 string                           `json:"name,omitempty"`
-	ChannelID            string                           `json:"channel_id,omitempty"`
-	Alias                string                           `json:"alias,omitempty"`
-	ParentID             *string                          `json:"parent_id,omitempty"`
-	ParentAlias          string                           `json:"parent_alias,omitempty"`
-	Position             *int                             `json:"position,omitempty"`
-	SyncPermissions      *bool                            `json:"sync_permissions,omitempty"`
-	PermissionOverwrites []channelPlanPermissionOverwrite `json:"permission_overwrites,omitempty"`
+	Op                           string                            `json:"op"`
+	Name                         string                            `json:"name,omitempty"`
+	ChannelID                    string                            `json:"channel_id,omitempty"`
+	Alias                        string                            `json:"alias,omitempty"`
+	ParentID                     *string                           `json:"parent_id,omitempty"`
+	ParentAlias                  string                            `json:"parent_alias,omitempty"`
+	Position                     *int                              `json:"position,omitempty"`
+	SyncPermissions              *bool                             `json:"sync_permissions,omitempty"`
+	PermissionOverwrites         []channelPlanPermissionOverwrite  `json:"permission_overwrites,omitempty"`
+	ExpectedPermissionOverwrites *[]channelPlanPermissionOverwrite `json:"expected_permission_overwrites,omitempty"`
 }
 
 type channelPlanPermissionOverwrite struct {
@@ -37,11 +39,12 @@ type channelPlanPermissionOverwrite struct {
 }
 
 const (
-	operationCreateCategory    = "create_category"
-	operationCreateTextChannel = "create_text_channel"
-	operationRenameChannel     = "rename_channel"
-	operationMoveChannel       = "move_channel"
-	operationSetPosition       = "set_position"
+	operationCreateCategory          = "create_category"
+	operationCreateTextChannel       = "create_text_channel"
+	operationRenameChannel           = "rename_channel"
+	operationMoveChannel             = "move_channel"
+	operationSetPosition             = "set_position"
+	operationSetPermissionOverwrites = "set_permission_overwrites"
 )
 
 func runPlanInitCommand(args []string, stdout io.Writer, stderr io.Writer) int {
@@ -139,7 +142,7 @@ func runApplyCommand(args []string, globalOptions cliOptions, stdout io.Writer, 
 	}
 	fmt.Fprintf(stdout, "wrote pre-apply snapshot to %s\n", snapshotPath)
 
-	if err := applyChannelPlan(ctx, client, plan); err != nil {
+	if err := applyChannelPlan(ctx, client, plan, channels); err != nil {
 		fmt.Fprintf(stderr, "%v\n", err)
 		return 1
 	}
@@ -159,10 +162,11 @@ func preApplySnapshotPath(planPath string) string {
 type planApplyState struct {
 	aliases       map[string]string
 	roleIDsByName map[string]string
+	channelsByID  map[string]DiscordChannel
 }
 
-func applyChannelPlan(ctx context.Context, client channelApplyClient, plan channelPlan) error {
-	state, err := newPlanApplyState(ctx, client, plan)
+func applyChannelPlan(ctx context.Context, client channelApplyClient, plan channelPlan, preApplyChannels []DiscordChannel) error {
+	state, err := newPlanApplyState(ctx, client, plan, preApplyChannels)
 	if err != nil {
 		return err
 	}
@@ -174,8 +178,11 @@ func applyChannelPlan(ctx context.Context, client channelApplyClient, plan chann
 	return nil
 }
 
-func newPlanApplyState(ctx context.Context, client channelApplyClient, plan channelPlan) (*planApplyState, error) {
-	state := &planApplyState{aliases: map[string]string{}, roleIDsByName: map[string]string{}}
+func newPlanApplyState(ctx context.Context, client channelApplyClient, plan channelPlan, preApplyChannels []DiscordChannel) (*planApplyState, error) {
+	state := &planApplyState{aliases: map[string]string{}, roleIDsByName: map[string]string{}, channelsByID: map[string]DiscordChannel{}}
+	for _, channel := range preApplyChannels {
+		state.channelsByID[channel.ID] = channel
+	}
 	if !planUsesRoleNames(plan) {
 		return state, nil
 	}
@@ -204,6 +211,13 @@ func planUsesRoleNames(plan channelPlan) bool {
 		for _, overwrite := range operation.PermissionOverwrites {
 			if strings.TrimSpace(overwrite.RoleName) != "" {
 				return true
+			}
+		}
+		if operation.ExpectedPermissionOverwrites != nil {
+			for _, overwrite := range *operation.ExpectedPermissionOverwrites {
+				if strings.TrimSpace(overwrite.RoleName) != "" {
+					return true
+				}
 			}
 		}
 	}
@@ -262,9 +276,65 @@ func applyChannelPlanOperation(ctx context.Context, client channelApplyClient, g
 	case operationSetPosition:
 		_, err := client.UpdateChannel(ctx, operation.ChannelID, UpdateChannelRequest{Position: operation.Position})
 		return err
+	case operationSetPermissionOverwrites:
+		overwrites, err := resolvePermissionOverwrites(operation.PermissionOverwrites, state)
+		if err != nil {
+			return err
+		}
+		if operation.ExpectedPermissionOverwrites != nil {
+			expected, err := resolvePermissionOverwrites(*operation.ExpectedPermissionOverwrites, state)
+			if err != nil {
+				return err
+			}
+			if err := verifyExpectedPermissionOverwrites(operation.ChannelID, expected, state); err != nil {
+				return err
+			}
+		}
+		_, err = client.UpdateChannel(ctx, operation.ChannelID, UpdateChannelRequest{PermissionOverwrites: &overwrites})
+		return err
 	default:
 		return unsupportedOperationError(operation.Op)
 	}
+}
+
+func verifyExpectedPermissionOverwrites(channelID string, expected []PermissionOverwrite, state *planApplyState) error {
+	channelID = strings.TrimSpace(channelID)
+	channel, ok := state.channelsByID[channelID]
+	if !ok {
+		return fmt.Errorf("expected_permission_overwrites check failed for channel %s: channel was not found in pre-apply snapshot", channelID)
+	}
+	if permissionOverwritesEqual(channel.PermissionOverwrites, expected) {
+		return nil
+	}
+	return fmt.Errorf(
+		"expected_permission_overwrites check failed for channel %s: current %s does not match expected %s",
+		channelID,
+		formatResolvedPermissionOverwrites(channel.PermissionOverwrites),
+		formatResolvedPermissionOverwrites(expected),
+	)
+}
+
+func permissionOverwritesEqual(left []PermissionOverwrite, right []PermissionOverwrite) bool {
+	leftCanonical := canonicalPermissionOverwrites(left)
+	rightCanonical := canonicalPermissionOverwrites(right)
+	if len(leftCanonical) != len(rightCanonical) {
+		return false
+	}
+	for index := range leftCanonical {
+		if leftCanonical[index] != rightCanonical[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func canonicalPermissionOverwrites(overwrites []PermissionOverwrite) []string {
+	canonical := make([]string, 0, len(overwrites))
+	for _, overwrite := range overwrites {
+		canonical = append(canonical, fmt.Sprintf("%d\x00%s\x00%s\x00%s", overwrite.Type, overwrite.ID, normalizePermissionBits(overwrite.Allow), normalizePermissionBits(overwrite.Deny)))
+	}
+	sort.Strings(canonical)
+	return canonical
 }
 
 func rememberAlias(operation channelPlanOperation, created DiscordChannel, state *planApplyState) {
@@ -443,6 +513,23 @@ func validateChannelPlanOperation(operation channelPlanOperation, aliases map[st
 			return err
 		}
 		return requirePosition(operation)
+	case operationSetPermissionOverwrites:
+		if err := requireChannelID(operation); err != nil {
+			return err
+		}
+		if err := rejectPermissionOverwriteReplacementFields(operation); err != nil {
+			return err
+		}
+		if len(operation.PermissionOverwrites) == 0 {
+			return fmt.Errorf("permission_overwrites must contain at least one role overwrite")
+		}
+		if err := validatePermissionOverwrites(operation.PermissionOverwrites); err != nil {
+			return err
+		}
+		if operation.ExpectedPermissionOverwrites != nil {
+			return validatePermissionOverwrites(*operation.ExpectedPermissionOverwrites)
+		}
+		return nil
 	default:
 		return unsupportedOperationError(operation.Op)
 	}
@@ -452,14 +539,36 @@ func validateGenericOperationFields(operation channelPlanOperation) error {
 	if strings.TrimSpace(operation.Alias) != "" && operation.Op != operationCreateCategory && operation.Op != operationCreateTextChannel {
 		return fmt.Errorf("alias is only supported on create_category and create_text_channel")
 	}
-	if len(operation.PermissionOverwrites) > 0 && operation.Op != operationCreateCategory && operation.Op != operationCreateTextChannel {
-		return fmt.Errorf("permission_overwrites is only supported on create_category and create_text_channel")
+	if len(operation.PermissionOverwrites) > 0 && operation.Op != operationCreateCategory && operation.Op != operationCreateTextChannel && operation.Op != operationSetPermissionOverwrites {
+		return fmt.Errorf("permission_overwrites is only supported on create_category, create_text_channel, and set_permission_overwrites")
+	}
+	if operation.ExpectedPermissionOverwrites != nil && operation.Op != operationSetPermissionOverwrites {
+		return fmt.Errorf("expected_permission_overwrites is only supported on set_permission_overwrites")
 	}
 	if operation.SyncPermissions != nil && operation.Op != operationMoveChannel {
 		return fmt.Errorf("sync_permissions is only supported on move_channel")
 	}
 	if strings.TrimSpace(operation.ParentAlias) != "" && operation.Op != operationCreateTextChannel && operation.Op != operationMoveChannel {
 		return fmt.Errorf("parent_alias is only supported on create_text_channel and move_channel")
+	}
+	return nil
+}
+
+func rejectPermissionOverwriteReplacementFields(operation channelPlanOperation) error {
+	if strings.TrimSpace(operation.Name) != "" {
+		return fmt.Errorf("name is not supported on set_permission_overwrites")
+	}
+	if strings.TrimSpace(operation.Alias) != "" {
+		return fmt.Errorf("alias is not supported on set_permission_overwrites")
+	}
+	if operation.ParentID != nil || strings.TrimSpace(operation.ParentAlias) != "" {
+		return fmt.Errorf("parent_id and parent_alias are not supported on set_permission_overwrites")
+	}
+	if operation.Position != nil {
+		return fmt.Errorf("position is not supported on set_permission_overwrites")
+	}
+	if operation.SyncPermissions != nil {
+		return fmt.Errorf("sync_permissions is not supported on set_permission_overwrites")
 	}
 	return nil
 }
@@ -584,7 +693,7 @@ func unsupportedOperationError(operation string) error {
 	if operation == "" {
 		return fmt.Errorf("unsupported operation: op is required")
 	}
-	return fmt.Errorf("unsupported operation %q; delete, direct permission mutation, role, and unknown operations are not supported", operation)
+	return fmt.Errorf("unsupported operation %q; delete, partial/direct permission mutation, role, and unknown operations are not supported", operation)
 }
 
 func printPlanDiff(w io.Writer, plan channelPlan) {
@@ -627,6 +736,13 @@ func printOperationDiff(w io.Writer, label string, plan channelPlan) {
 			fmt.Fprintln(w, line)
 		case operationSetPosition:
 			fmt.Fprintf(w, "~ set position of channel %s to %d\n", operation.ChannelID, *operation.Position)
+		case operationSetPermissionOverwrites:
+			line := fmt.Sprintf("~ replace permission overwrites on channel %s", operation.ChannelID)
+			if operation.ExpectedPermissionOverwrites != nil {
+				line += fmt.Sprintf(" from %s", formatPlanPermissionOverwrites(*operation.ExpectedPermissionOverwrites))
+			}
+			line += fmt.Sprintf(" to %s", formatPlanPermissionOverwrites(operation.PermissionOverwrites))
+			fmt.Fprintln(w, line)
 		}
 	}
 }
@@ -652,13 +768,25 @@ func permissionOverwriteSuffix(operation channelPlanOperation) string {
 	if len(operation.PermissionOverwrites) == 0 {
 		return ""
 	}
-	parts := make([]string, 0, len(operation.PermissionOverwrites))
-	for _, overwrite := range operation.PermissionOverwrites {
+	return " with permission overwrites " + formatPlanPermissionOverwrites(operation.PermissionOverwrites)
+}
+
+func formatPlanPermissionOverwrites(overwrites []channelPlanPermissionOverwrite) string {
+	parts := make([]string, 0, len(overwrites))
+	for _, overwrite := range overwrites {
 		target := overwrite.RoleName
 		if target == "" {
 			target = overwrite.RoleID
 		}
 		parts = append(parts, fmt.Sprintf("@%s allow=%s deny=%s", target, normalizePermissionBits(overwrite.Allow), normalizePermissionBits(overwrite.Deny)))
 	}
-	return " with permission overwrites [" + strings.Join(parts, "; ") + "]"
+	return "[" + strings.Join(parts, "; ") + "]"
+}
+
+func formatResolvedPermissionOverwrites(overwrites []PermissionOverwrite) string {
+	parts := make([]string, 0, len(overwrites))
+	for _, overwrite := range overwrites {
+		parts = append(parts, fmt.Sprintf("@%s allow=%s deny=%s", overwrite.ID, normalizePermissionBits(overwrite.Allow), normalizePermissionBits(overwrite.Deny)))
+	}
+	return "[" + strings.Join(parts, "; ") + "]"
 }

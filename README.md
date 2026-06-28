@@ -90,6 +90,7 @@ The plan schema currently supports these operations:
 - `rename_channel`
 - `move_channel`
 - `set_position`
+- `set_permission_overwrites`
 
 `create_category` and `create_text_channel` may include
 `permission_overwrites` for role targets only, using `role_name` (resolved at
@@ -98,6 +99,14 @@ apply time) or `role_id`. `create_*` operations may also set an `alias`; later
 earlier in the same plan. `move_channel` supports `sync_permissions: true`,
 which sends Discord's `lock_permissions` flag so the moved channel syncs to the
 target category's permission overwrites.
+
+`set_permission_overwrites` replaces one existing channel or category's full
+`permission_overwrites` array with reviewed exact role-only overwrites. It does
+not support member overwrites, role creation/changes, or partial add/remove
+permission operations. For an additional guard, include
+`expected_permission_overwrites` (including `[]` when the current channel should
+have no overwrites); `apply --yes` verifies the pre-apply snapshot matches that
+expectation before making the PATCH write.
 
 ### Dry-run a plan
 
@@ -129,11 +138,12 @@ automation unless the exact plan has already been reviewed.
 v1 intentionally excludes:
 
 - Channel deletes.
-- Direct per-channel permission mutation outside reviewed create/sync plans.
+- Partial/direct per-channel permission mutation outside reviewed exact
+  overwrite-replacement and create/sync plans.
 - Role creation or role changes.
 - Message or member moderation.
 
-Unsupported, destructive, direct permission mutation, role, and unknown
+Unsupported, destructive, partial/direct permission mutation, role, and unknown
 operations are rejected during plan validation before the write path.
 
 ## GitHub repository management
