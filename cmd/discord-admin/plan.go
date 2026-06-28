@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -16,11 +17,23 @@ type channelPlan struct {
 }
 
 type channelPlanOperation struct {
-	Op        string  `json:"op"`
-	Name      string  `json:"name,omitempty"`
-	ChannelID string  `json:"channel_id,omitempty"`
-	ParentID  *string `json:"parent_id,omitempty"`
-	Position  *int    `json:"position,omitempty"`
+	Op                   string                           `json:"op"`
+	Name                 string                           `json:"name,omitempty"`
+	ChannelID            string                           `json:"channel_id,omitempty"`
+	Alias                string                           `json:"alias,omitempty"`
+	ParentID             *string                          `json:"parent_id,omitempty"`
+	ParentAlias          string                           `json:"parent_alias,omitempty"`
+	Position             *int                             `json:"position,omitempty"`
+	SyncPermissions      *bool                            `json:"sync_permissions,omitempty"`
+	PermissionOverwrites []channelPlanPermissionOverwrite `json:"permission_overwrites,omitempty"`
+}
+
+type channelPlanPermissionOverwrite struct {
+	RoleName string `json:"role_name,omitempty"`
+	RoleID   string `json:"role_id,omitempty"`
+	Type     string `json:"type,omitempty"`
+	Allow    string `json:"allow,omitempty"`
+	Deny     string `json:"deny,omitempty"`
 }
 
 const (
@@ -50,15 +63,24 @@ func sampleChannelPlan() channelPlan {
 	categoryPosition := 0
 	textParentID := "replace-with-category-id"
 	textPosition := 1
-	moveParentID := "replace-with-target-category-id"
+	moveParentAlias := "projects"
 	setPosition := 2
+	syncPermissions := true
 	return channelPlan{
 		GuildID: "replace-with-guild-id",
 		Operations: []channelPlanOperation{
-			{Op: operationCreateCategory, Name: "Projects", Position: &categoryPosition},
+			{
+				Op:       operationCreateCategory,
+				Name:     "Projects",
+				Alias:    "projects",
+				Position: &categoryPosition,
+				PermissionOverwrites: []channelPlanPermissionOverwrite{
+					{RoleName: "project-bot", Allow: "0", Deny: "0"},
+				},
+			},
 			{Op: operationCreateTextChannel, Name: "project-alpha", ParentID: &textParentID, Position: &textPosition},
 			{Op: operationRenameChannel, ChannelID: "replace-with-channel-id", Name: "new-channel-name"},
-			{Op: operationMoveChannel, ChannelID: "replace-with-channel-id", ParentID: &moveParentID},
+			{Op: operationMoveChannel, ChannelID: "replace-with-channel-id", ParentAlias: moveParentAlias, SyncPermissions: &syncPermissions},
 			{Op: operationSetPosition, ChannelID: "replace-with-channel-id", Position: &setPosition},
 		},
 	}
@@ -93,7 +115,6 @@ func runApplyCommand(args []string, globalOptions cliOptions, stdout io.Writer, 
 	}
 
 	printApplyDiff(stdout, plan)
-
 	auth, err := loadAuth(globalOptions.Auth)
 	if err != nil {
 		fmt.Fprintf(stderr, "%v\n", err)
@@ -135,37 +156,108 @@ func preApplySnapshotPath(planPath string) string {
 	return filepath.Join(filepath.Dir(planPath), baseName+".pre-apply-snapshot.json")
 }
 
+type planApplyState struct {
+	aliases       map[string]string
+	roleIDsByName map[string]string
+}
+
 func applyChannelPlan(ctx context.Context, client channelApplyClient, plan channelPlan) error {
+	state, err := newPlanApplyState(ctx, client, plan)
+	if err != nil {
+		return err
+	}
 	for index, operation := range plan.Operations {
-		if err := applyChannelPlanOperation(ctx, client, plan.GuildID, operation); err != nil {
+		if err := applyChannelPlanOperation(ctx, client, plan.GuildID, operation, state); err != nil {
 			return fmt.Errorf("apply operation %d (%s): %w", index+1, operation.Op, err)
 		}
 	}
 	return nil
 }
 
-func applyChannelPlanOperation(ctx context.Context, client channelApplyClient, guildID string, operation channelPlanOperation) error {
+func newPlanApplyState(ctx context.Context, client channelApplyClient, plan channelPlan) (*planApplyState, error) {
+	state := &planApplyState{aliases: map[string]string{}, roleIDsByName: map[string]string{}}
+	if !planUsesRoleNames(plan) {
+		return state, nil
+	}
+	roles, err := client.GetGuildRoles(ctx, plan.GuildID)
+	if err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	for _, role := range roles {
+		name := strings.TrimSpace(role.Name)
+		if name == "" {
+			continue
+		}
+		if seen[name] {
+			delete(state.roleIDsByName, name)
+			continue
+		}
+		seen[name] = true
+		state.roleIDsByName[name] = role.ID
+	}
+	return state, nil
+}
+
+func planUsesRoleNames(plan channelPlan) bool {
+	for _, operation := range plan.Operations {
+		for _, overwrite := range operation.PermissionOverwrites {
+			if strings.TrimSpace(overwrite.RoleName) != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func applyChannelPlanOperation(ctx context.Context, client channelApplyClient, guildID string, operation channelPlanOperation, state *planApplyState) error {
 	switch operation.Op {
 	case operationCreateCategory:
-		_, err := client.CreateGuildChannel(ctx, guildID, CreateGuildChannelRequest{
-			Name:     operation.Name,
-			Type:     ChannelTypeGuildCategory,
-			Position: operation.Position,
+		overwrites, err := resolvePermissionOverwrites(operation.PermissionOverwrites, state)
+		if err != nil {
+			return err
+		}
+		created, err := client.CreateGuildChannel(ctx, guildID, CreateGuildChannelRequest{
+			Name:                 operation.Name,
+			Type:                 ChannelTypeGuildCategory,
+			Position:             operation.Position,
+			PermissionOverwrites: overwrites,
 		})
-		return err
+		if err != nil {
+			return err
+		}
+		rememberAlias(operation, created, state)
+		return nil
 	case operationCreateTextChannel:
-		_, err := client.CreateGuildChannel(ctx, guildID, CreateGuildChannelRequest{
-			Name:     operation.Name,
-			Type:     ChannelTypeGuildText,
-			ParentID: operation.ParentID,
-			Position: operation.Position,
+		parentID, err := resolveParentID(operation, state)
+		if err != nil {
+			return err
+		}
+		overwrites, err := resolvePermissionOverwrites(operation.PermissionOverwrites, state)
+		if err != nil {
+			return err
+		}
+		created, err := client.CreateGuildChannel(ctx, guildID, CreateGuildChannelRequest{
+			Name:                 operation.Name,
+			Type:                 ChannelTypeGuildText,
+			ParentID:             parentID,
+			Position:             operation.Position,
+			PermissionOverwrites: overwrites,
 		})
-		return err
+		if err != nil {
+			return err
+		}
+		rememberAlias(operation, created, state)
+		return nil
 	case operationRenameChannel:
 		_, err := client.UpdateChannel(ctx, operation.ChannelID, UpdateChannelRequest{Name: &operation.Name})
 		return err
 	case operationMoveChannel:
-		_, err := client.UpdateChannel(ctx, operation.ChannelID, UpdateChannelRequest{ParentID: operation.ParentID})
+		parentID, err := resolveParentID(operation, state)
+		if err != nil {
+			return err
+		}
+		_, err = client.UpdateChannel(ctx, operation.ChannelID, UpdateChannelRequest{ParentID: parentID, LockPermissions: operation.SyncPermissions})
 		return err
 	case operationSetPosition:
 		_, err := client.UpdateChannel(ctx, operation.ChannelID, UpdateChannelRequest{Position: operation.Position})
@@ -173,6 +265,65 @@ func applyChannelPlanOperation(ctx context.Context, client channelApplyClient, g
 	default:
 		return unsupportedOperationError(operation.Op)
 	}
+}
+
+func rememberAlias(operation channelPlanOperation, created DiscordChannel, state *planApplyState) {
+	alias := strings.TrimSpace(operation.Alias)
+	if alias == "" {
+		return
+	}
+	state.aliases[alias] = created.ID
+}
+
+func resolveParentID(operation channelPlanOperation, state *planApplyState) (*string, error) {
+	if operation.ParentID != nil {
+		parentID := strings.TrimSpace(*operation.ParentID)
+		return &parentID, nil
+	}
+	alias := strings.TrimSpace(operation.ParentAlias)
+	if alias == "" {
+		return nil, nil
+	}
+	parentID, ok := state.aliases[alias]
+	if !ok || parentID == "" {
+		return nil, fmt.Errorf("parent_alias %q has not been created earlier in the plan", alias)
+	}
+	return &parentID, nil
+}
+
+func resolvePermissionOverwrites(overwrites []channelPlanPermissionOverwrite, state *planApplyState) ([]PermissionOverwrite, error) {
+	if len(overwrites) == 0 {
+		return nil, nil
+	}
+	resolved := make([]PermissionOverwrite, 0, len(overwrites))
+	for _, overwrite := range overwrites {
+		roleID := strings.TrimSpace(overwrite.RoleID)
+		roleName := strings.TrimSpace(overwrite.RoleName)
+		if roleName != "" {
+			var ok bool
+			roleID, ok = state.roleIDsByName[roleName]
+			if !ok || roleID == "" {
+				return nil, fmt.Errorf("role_name %q was not found or is ambiguous", roleName)
+			}
+		}
+		allow := normalizePermissionBits(overwrite.Allow)
+		deny := normalizePermissionBits(overwrite.Deny)
+		resolved = append(resolved, PermissionOverwrite{
+			ID:    roleID,
+			Type:  PermissionOverwriteTypeRole,
+			Allow: allow,
+			Deny:  deny,
+		})
+	}
+	return resolved, nil
+}
+
+func normalizePermissionBits(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "0"
+	}
+	return value
 }
 
 func parseApplyOptions(args []string) (applyOptions, error) {
@@ -234,18 +385,32 @@ func validateChannelPlan(plan channelPlan) error {
 	if len(plan.Operations) == 0 {
 		return fmt.Errorf("plan validation failed: operations must contain at least one operation")
 	}
+	aliases := map[string]bool{}
 	for index, operation := range plan.Operations {
-		if err := validateChannelPlanOperation(operation); err != nil {
+		if err := validateChannelPlanOperation(operation, aliases); err != nil {
 			return fmt.Errorf("plan validation failed: operation %d: %w", index+1, err)
+		}
+		alias := strings.TrimSpace(operation.Alias)
+		if alias != "" {
+			aliases[alias] = true
 		}
 	}
 	return nil
 }
 
-func validateChannelPlanOperation(operation channelPlanOperation) error {
+func validateChannelPlanOperation(operation channelPlanOperation, aliases map[string]bool) error {
+	if err := validateGenericOperationFields(operation); err != nil {
+		return err
+	}
 	switch operation.Op {
 	case operationCreateCategory:
 		if err := requireName(operation); err != nil {
+			return err
+		}
+		if err := validateCreateAlias(operation, aliases); err != nil {
+			return err
+		}
+		if err := validatePermissionOverwrites(operation.PermissionOverwrites); err != nil {
 			return err
 		}
 		return validateOptionalPosition(operation)
@@ -253,7 +418,13 @@ func validateChannelPlanOperation(operation channelPlanOperation) error {
 		if err := requireName(operation); err != nil {
 			return err
 		}
-		if err := validateOptionalParentID(operation); err != nil {
+		if err := validateCreateAlias(operation, aliases); err != nil {
+			return err
+		}
+		if err := validateOptionalParentReference(operation, aliases); err != nil {
+			return err
+		}
+		if err := validatePermissionOverwrites(operation.PermissionOverwrites); err != nil {
 			return err
 		}
 		return validateOptionalPosition(operation)
@@ -266,7 +437,7 @@ func validateChannelPlanOperation(operation channelPlanOperation) error {
 		if err := requireChannelID(operation); err != nil {
 			return err
 		}
-		return requireParentID(operation)
+		return requireParentReference(operation, aliases)
 	case operationSetPosition:
 		if err := requireChannelID(operation); err != nil {
 			return err
@@ -275,6 +446,22 @@ func validateChannelPlanOperation(operation channelPlanOperation) error {
 	default:
 		return unsupportedOperationError(operation.Op)
 	}
+}
+
+func validateGenericOperationFields(operation channelPlanOperation) error {
+	if strings.TrimSpace(operation.Alias) != "" && operation.Op != operationCreateCategory && operation.Op != operationCreateTextChannel {
+		return fmt.Errorf("alias is only supported on create_category and create_text_channel")
+	}
+	if len(operation.PermissionOverwrites) > 0 && operation.Op != operationCreateCategory && operation.Op != operationCreateTextChannel {
+		return fmt.Errorf("permission_overwrites is only supported on create_category and create_text_channel")
+	}
+	if operation.SyncPermissions != nil && operation.Op != operationMoveChannel {
+		return fmt.Errorf("sync_permissions is only supported on move_channel")
+	}
+	if strings.TrimSpace(operation.ParentAlias) != "" && operation.Op != operationCreateTextChannel && operation.Op != operationMoveChannel {
+		return fmt.Errorf("parent_alias is only supported on create_text_channel and move_channel")
+	}
+	return nil
 }
 
 func requireName(operation channelPlanOperation) error {
@@ -291,16 +478,47 @@ func requireChannelID(operation channelPlanOperation) error {
 	return nil
 }
 
-func requireParentID(operation channelPlanOperation) error {
-	if operation.ParentID == nil || strings.TrimSpace(*operation.ParentID) == "" {
-		return fmt.Errorf("parent_id is required")
+func validateCreateAlias(operation channelPlanOperation, aliases map[string]bool) error {
+	alias := strings.TrimSpace(operation.Alias)
+	if alias == "" {
+		return nil
+	}
+	if aliases[alias] {
+		return fmt.Errorf("alias %q is already used by an earlier create operation", alias)
 	}
 	return nil
 }
 
-func validateOptionalParentID(operation channelPlanOperation) error {
+func requireParentReference(operation channelPlanOperation, aliases map[string]bool) error {
 	if operation.ParentID != nil && strings.TrimSpace(*operation.ParentID) == "" {
 		return fmt.Errorf("parent_id must not be empty when provided")
+	}
+	if operation.ParentID != nil && strings.TrimSpace(operation.ParentAlias) != "" {
+		return fmt.Errorf("provide only one of parent_id or parent_alias")
+	}
+	if operation.ParentID == nil && strings.TrimSpace(operation.ParentAlias) == "" {
+		return fmt.Errorf("parent_id or parent_alias is required")
+	}
+	return validateParentAliasExists(operation, aliases)
+}
+
+func validateOptionalParentReference(operation channelPlanOperation, aliases map[string]bool) error {
+	if operation.ParentID != nil && strings.TrimSpace(*operation.ParentID) == "" {
+		return fmt.Errorf("parent_id must not be empty when provided")
+	}
+	if operation.ParentID != nil && strings.TrimSpace(operation.ParentAlias) != "" {
+		return fmt.Errorf("provide only one of parent_id or parent_alias")
+	}
+	return validateParentAliasExists(operation, aliases)
+}
+
+func validateParentAliasExists(operation channelPlanOperation, aliases map[string]bool) error {
+	alias := strings.TrimSpace(operation.ParentAlias)
+	if alias == "" {
+		return nil
+	}
+	if !aliases[alias] {
+		return fmt.Errorf("parent_alias %q must reference an earlier create operation alias", alias)
 	}
 	return nil
 }
@@ -322,12 +540,51 @@ func validateOptionalPosition(operation channelPlanOperation) error {
 	return nil
 }
 
+func validatePermissionOverwrites(overwrites []channelPlanPermissionOverwrite) error {
+	for index, overwrite := range overwrites {
+		if err := validatePermissionOverwrite(overwrite); err != nil {
+			return fmt.Errorf("permission_overwrites[%d]: %w", index, err)
+		}
+	}
+	return nil
+}
+
+func validatePermissionOverwrite(overwrite channelPlanPermissionOverwrite) error {
+	overwriteType := strings.TrimSpace(overwrite.Type)
+	if overwriteType != "" && overwriteType != "role" {
+		return fmt.Errorf("only role permission overwrites are supported")
+	}
+	roleName := strings.TrimSpace(overwrite.RoleName)
+	roleID := strings.TrimSpace(overwrite.RoleID)
+	if roleName == "" && roleID == "" {
+		return fmt.Errorf("role_name or role_id is required")
+	}
+	if roleName != "" && roleID != "" {
+		return fmt.Errorf("provide only one of role_name or role_id")
+	}
+	if err := validatePermissionBitString("allow", overwrite.Allow); err != nil {
+		return err
+	}
+	return validatePermissionBitString("deny", overwrite.Deny)
+}
+
+func validatePermissionBitString(name string, value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	if _, err := strconv.ParseUint(value, 10, 64); err != nil {
+		return fmt.Errorf("%s must be an unsigned decimal permission bit string", name)
+	}
+	return nil
+}
+
 func unsupportedOperationError(operation string) error {
 	operation = strings.TrimSpace(operation)
 	if operation == "" {
 		return fmt.Errorf("unsupported operation: op is required")
 	}
-	return fmt.Errorf("unsupported operation %q; delete, permission, role, and unknown operations are not supported", operation)
+	return fmt.Errorf("unsupported operation %q; delete, direct permission mutation, role, and unknown operations are not supported", operation)
 }
 
 func printPlanDiff(w io.Writer, plan channelPlan) {
@@ -343,26 +600,65 @@ func printOperationDiff(w io.Writer, label string, plan channelPlan) {
 	for _, operation := range plan.Operations {
 		switch operation.Op {
 		case operationCreateCategory:
-			if operation.Position != nil {
-				fmt.Fprintf(w, "+ create category %s at position %d\n", operation.Name, *operation.Position)
-			} else {
-				fmt.Fprintf(w, "+ create category %s\n", operation.Name)
-			}
-		case operationCreateTextChannel:
-			line := fmt.Sprintf("+ create text channel %s", operation.Name)
-			if operation.ParentID != nil {
-				line += fmt.Sprintf(" under %s", *operation.ParentID)
-			}
+			line := fmt.Sprintf("+ create category %s", operation.Name)
 			if operation.Position != nil {
 				line += fmt.Sprintf(" at position %d", *operation.Position)
 			}
+			line += aliasSuffix(operation)
+			line += permissionOverwriteSuffix(operation)
+			fmt.Fprintln(w, line)
+		case operationCreateTextChannel:
+			line := fmt.Sprintf("+ create text channel %s", operation.Name)
+			line += parentSuffix(operation)
+			if operation.Position != nil {
+				line += fmt.Sprintf(" at position %d", *operation.Position)
+			}
+			line += aliasSuffix(operation)
+			line += permissionOverwriteSuffix(operation)
 			fmt.Fprintln(w, line)
 		case operationRenameChannel:
 			fmt.Fprintf(w, "~ rename channel %s to %s\n", operation.ChannelID, operation.Name)
 		case operationMoveChannel:
-			fmt.Fprintf(w, "~ move channel %s under %s\n", operation.ChannelID, *operation.ParentID)
+			line := fmt.Sprintf("~ move channel %s", operation.ChannelID)
+			line += parentSuffix(operation)
+			if operation.SyncPermissions != nil && *operation.SyncPermissions {
+				line += " and sync permissions"
+			}
+			fmt.Fprintln(w, line)
 		case operationSetPosition:
 			fmt.Fprintf(w, "~ set position of channel %s to %d\n", operation.ChannelID, *operation.Position)
 		}
 	}
+}
+
+func aliasSuffix(operation channelPlanOperation) string {
+	if strings.TrimSpace(operation.Alias) == "" {
+		return ""
+	}
+	return fmt.Sprintf(" as alias %s", operation.Alias)
+}
+
+func parentSuffix(operation channelPlanOperation) string {
+	if operation.ParentID != nil {
+		return fmt.Sprintf(" under %s", *operation.ParentID)
+	}
+	if strings.TrimSpace(operation.ParentAlias) != "" {
+		return fmt.Sprintf(" under alias %s", operation.ParentAlias)
+	}
+	return ""
+}
+
+func permissionOverwriteSuffix(operation channelPlanOperation) string {
+	if len(operation.PermissionOverwrites) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(operation.PermissionOverwrites))
+	for _, overwrite := range operation.PermissionOverwrites {
+		target := overwrite.RoleName
+		if target == "" {
+			target = overwrite.RoleID
+		}
+		parts = append(parts, fmt.Sprintf("@%s allow=%s deny=%s", target, normalizePermissionBits(overwrite.Allow), normalizePermissionBits(overwrite.Deny)))
+	}
+	return " with permission overwrites [" + strings.Join(parts, "; ") + "]"
 }

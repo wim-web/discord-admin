@@ -58,6 +58,11 @@ type DiscordUser struct {
 	Bot        bool   `json:"bot,omitempty"`
 }
 
+type DiscordRole struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+}
+
 type ChannelType int
 
 const (
@@ -66,26 +71,43 @@ const (
 	ChannelTypeGuildCategory ChannelType = 4
 )
 
+type PermissionOverwriteType int
+
+const (
+	PermissionOverwriteTypeRole   PermissionOverwriteType = 0
+	PermissionOverwriteTypeMember PermissionOverwriteType = 1
+)
+
+type PermissionOverwrite struct {
+	ID    string                  `json:"id"`
+	Type  PermissionOverwriteType `json:"type"`
+	Allow string                  `json:"allow"`
+	Deny  string                  `json:"deny"`
+}
+
 type DiscordChannel struct {
-	ID       string      `json:"id"`
-	GuildID  string      `json:"guild_id,omitempty"`
-	Name     string      `json:"name"`
-	Type     ChannelType `json:"type"`
-	ParentID *string     `json:"parent_id,omitempty"`
-	Position int         `json:"position,omitempty"`
+	ID                   string                `json:"id"`
+	GuildID              string                `json:"guild_id,omitempty"`
+	Name                 string                `json:"name"`
+	Type                 ChannelType           `json:"type"`
+	ParentID             *string               `json:"parent_id,omitempty"`
+	Position             int                   `json:"position,omitempty"`
+	PermissionOverwrites []PermissionOverwrite `json:"permission_overwrites,omitempty"`
 }
 
 type CreateGuildChannelRequest struct {
-	Name     string      `json:"name"`
-	Type     ChannelType `json:"type"`
-	ParentID *string     `json:"parent_id,omitempty"`
-	Position *int        `json:"position,omitempty"`
+	Name                 string                `json:"name"`
+	Type                 ChannelType           `json:"type"`
+	ParentID             *string               `json:"parent_id,omitempty"`
+	Position             *int                  `json:"position,omitempty"`
+	PermissionOverwrites []PermissionOverwrite `json:"permission_overwrites,omitempty"`
 }
 
 type UpdateChannelRequest struct {
-	Name     *string `json:"name,omitempty"`
-	ParentID *string `json:"parent_id,omitempty"`
-	Position *int    `json:"position,omitempty"`
+	Name            *string `json:"name,omitempty"`
+	ParentID        *string `json:"parent_id,omitempty"`
+	Position        *int    `json:"position,omitempty"`
+	LockPermissions *bool   `json:"lock_permissions,omitempty"`
 }
 
 func (client *DiscordClient) GetCurrentUser(ctx context.Context) (DiscordUser, error) {
@@ -104,6 +126,12 @@ func (client *DiscordClient) GetGuildChannels(ctx context.Context, guildID strin
 	var channels []DiscordChannel
 	err := client.doJSON(ctx, http.MethodGet, "/guilds/"+url.PathEscape(guildID)+"/channels", nil, &channels)
 	return channels, err
+}
+
+func (client *DiscordClient) GetGuildRoles(ctx context.Context, guildID string) ([]DiscordRole, error) {
+	var roles []DiscordRole
+	err := client.doJSON(ctx, http.MethodGet, "/guilds/"+url.PathEscape(guildID)+"/roles", nil, &roles)
+	return roles, err
 }
 
 func (client *DiscordClient) CreateGuildChannel(ctx context.Context, guildID string, request CreateGuildChannelRequest) (DiscordChannel, error) {

@@ -4,7 +4,8 @@ A small Go CLI for managing Discord server channel organization through the
 Discord REST API.
 
 This repository is intentionally dependency-light and safety-focused. The v1
-command surface is limited to non-permission channel organization workflows.
+command surface is limited to channel organization workflows plus guarded
+category-level role permission overwrites that are expressed in reviewed plans.
 
 ## Module
 
@@ -90,6 +91,14 @@ The plan schema currently supports these operations:
 - `move_channel`
 - `set_position`
 
+`create_category` and `create_text_channel` may include
+`permission_overwrites` for role targets only, using `role_name` (resolved at
+apply time) or `role_id`. `create_*` operations may also set an `alias`; later
+`move_channel` operations can use `parent_alias` to refer to a category created
+earlier in the same plan. `move_channel` supports `sync_permissions: true`,
+which sends Discord's `lock_permissions` flag so the moved channel syncs to the
+target category's permission overwrites.
+
 ### Dry-run a plan
 
 Validate a plan and print the proposed changes without making Discord API write
@@ -120,12 +129,12 @@ automation unless the exact plan has already been reviewed.
 v1 intentionally excludes:
 
 - Channel deletes.
-- Permission overwrites.
+- Direct per-channel permission mutation outside reviewed create/sync plans.
 - Role creation or role changes.
 - Message or member moderation.
 
-Unsupported, destructive, permission, role, and unknown operations are rejected
-during plan validation before the write path.
+Unsupported, destructive, direct permission mutation, role, and unknown
+operations are rejected during plan validation before the write path.
 
 ## GitHub repository management
 

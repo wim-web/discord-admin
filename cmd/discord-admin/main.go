@@ -48,6 +48,7 @@ type guildChannelsClient interface {
 
 type channelApplyClient interface {
 	guildChannelsClient
+	GetGuildRoles(ctx context.Context, guildID string) ([]DiscordRole, error)
 	CreateGuildChannel(ctx context.Context, guildID string, request CreateGuildChannelRequest) (DiscordChannel, error)
 	UpdateChannel(ctx context.Context, channelID string, request UpdateChannelRequest) (DiscordChannel, error)
 }
@@ -296,22 +297,24 @@ type guildSnapshot struct {
 }
 
 type snapshotChannel struct {
-	ID       string      `json:"id"`
-	Name     string      `json:"name"`
-	Type     ChannelType `json:"type"`
-	ParentID *string     `json:"parent_id"`
-	Position int         `json:"position"`
+	ID                   string                `json:"id"`
+	Name                 string                `json:"name"`
+	Type                 ChannelType           `json:"type"`
+	ParentID             *string               `json:"parent_id"`
+	Position             int                   `json:"position"`
+	PermissionOverwrites []PermissionOverwrite `json:"permission_overwrites,omitempty"`
 }
 
 func writeGuildSnapshot(path string, guildID string, channels []DiscordChannel) error {
 	snapshot := guildSnapshot{GuildID: guildID}
 	for _, channel := range sortedChannels(channels) {
 		snapshot.Channels = append(snapshot.Channels, snapshotChannel{
-			ID:       channel.ID,
-			Name:     channel.Name,
-			Type:     channel.Type,
-			ParentID: channel.ParentID,
-			Position: channel.Position,
+			ID:                   channel.ID,
+			Name:                 channel.Name,
+			Type:                 channel.Type,
+			ParentID:             channel.ParentID,
+			Position:             channel.Position,
+			PermissionOverwrites: channel.PermissionOverwrites,
 		})
 	}
 

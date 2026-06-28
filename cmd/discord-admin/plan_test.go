@@ -255,6 +255,123 @@ func TestRunApplyYesWritesPreApplySnapshotThenAppliesSupportedOperations(t *test
 	}
 }
 
+func TestRunApplyYesCreatesRolePermissionCategoryAndMovesWithAliasSync(t *testing.T) {
+	withoutDiscordBotToken(t)
+	token := "apply-token-secret"
+	envFile := writeTestEnvFile(t, map[string]string{discordBotTokenEnv: token})
+	dir := t.TempDir()
+	planPath := filepath.Join(dir, "plan.json")
+	plan := `{
+		"guild_id": "g1",
+		"operations": [
+			{
+				"op": "create_category",
+				"name": "ai-openclaw",
+				"alias": "ai-openclaw",
+				"permission_overwrites": [
+					{"role_name": "openclaw", "allow": "123", "deny": "0"}
+				]
+			},
+			{"op": "move_channel", "channel_id": "openclaw-channel", "parent_alias": "ai-openclaw", "sync_permissions": true}
+		]
+	}`
+	if err := os.WriteFile(planPath, []byte(plan), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	type capturedRequest struct {
+		Method string
+		Path   string
+		Body   map[string]any
+	}
+	requests := []capturedRequest{}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got, want := r.Header.Get("Authorization"), "Bot "+token; got != want {
+			t.Errorf("Authorization header = %q, want %q", got, want)
+		}
+		captured := capturedRequest{Method: r.Method, Path: r.URL.Path}
+		if r.Method != http.MethodGet {
+			if err := json.NewDecoder(r.Body).Decode(&captured.Body); err != nil {
+				t.Errorf("decode %s %s body: %v", r.Method, r.URL.Path, err)
+			}
+		}
+		requests = append(requests, captured)
+		w.Header().Set("Content-Type", "application/json")
+
+		switch r.Method + " " + r.URL.Path {
+		case "GET /guilds/g1/channels":
+			json.NewEncoder(w).Encode([]DiscordChannel{{ID: "openclaw-channel", Name: "openclaw", Type: ChannelTypeGuildText}})
+		case "GET /guilds/g1/roles":
+			json.NewEncoder(w).Encode([]DiscordRole{{ID: "role-openclaw", Name: "openclaw"}})
+		case "POST /guilds/g1/channels":
+			w.WriteHeader(http.StatusCreated)
+			json.NewEncoder(w).Encode(DiscordChannel{ID: "created-ai-openclaw", Name: "ai-openclaw", Type: ChannelTypeGuildCategory})
+		case "PATCH /channels/openclaw-channel":
+			json.NewEncoder(w).Encode(DiscordChannel{ID: "openclaw-channel", Name: "openclaw", Type: ChannelTypeGuildText})
+		default:
+			t.Errorf("unexpected request %s %s", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	exitCode := runWithDependencies(
+		[]string{"--env-file", envFile, "apply", planPath, "--yes"},
+		&stdout,
+		&stderr,
+		runDependencies{ClientFactory: testClientFactory(server, token)},
+	)
+
+	if exitCode != 0 {
+		t.Fatalf("run apply --yes exit code = %d, want 0; stdout=%q stderr=%q", exitCode, stdout.String(), stderr.String())
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+	wantOrder := []string{
+		"GET /guilds/g1/channels",
+		"GET /guilds/g1/roles",
+		"POST /guilds/g1/channels",
+		"PATCH /channels/openclaw-channel",
+	}
+	var gotOrder []string
+	for _, request := range requests {
+		gotOrder = append(gotOrder, request.Method+" "+request.Path)
+	}
+	if !reflect.DeepEqual(gotOrder, wantOrder) {
+		t.Fatalf("requests = %v, want %v", gotOrder, wantOrder)
+	}
+	wantBodies := []map[string]any{
+		{
+			"name": "ai-openclaw",
+			"type": float64(4),
+			"permission_overwrites": []any{
+				map[string]any{"id": "role-openclaw", "type": float64(0), "allow": "123", "deny": "0"},
+			},
+		},
+		{"parent_id": "created-ai-openclaw", "lock_permissions": true},
+	}
+	var gotBodies []map[string]any
+	for _, request := range requests[2:] {
+		gotBodies = append(gotBodies, request.Body)
+	}
+	if !reflect.DeepEqual(gotBodies, wantBodies) {
+		t.Fatalf("request bodies = %#v, want %#v", gotBodies, wantBodies)
+	}
+	assertContainsInOrder(t, stdout.String(), []string{
+		"Applying plan for guild g1: 2 operation(s)",
+		"+ create category ai-openclaw as alias ai-openclaw with permission overwrites [@openclaw allow=123 deny=0]",
+		"~ move channel openclaw-channel under alias ai-openclaw and sync permissions",
+		"applied 2 operation(s)",
+	})
+	if strings.Contains(stdout.String(), token) || strings.Contains(stderr.String(), token) {
+		t.Fatalf("apply output leaks token; stdout=%q stderr=%q", stdout.String(), stderr.String())
+	}
+}
+
 func TestRunApplyDryRunRejectsUnsupportedOperations(t *testing.T) {
 	for _, unsupportedOperation := range []string{"delete_channel", "set_permission", "create_role", "dance_channel"} {
 		t.Run(unsupportedOperation, func(t *testing.T) {
