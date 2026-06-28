@@ -1,0 +1,30 @@
+# Go build outputs
+/bin/
+/dist/
+/discord-admin
+*.test
+*.out
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+.envrc
+
+# Discord snapshots and pre-apply backups
+/snapshots/
+*.snapshot.json
+*.pre-apply-snapshot.json
+
+# Local plan scratch files
+/plans/local/
+*.local-plan.json
+*.scratch-plan.json
+
+# Editor and OS files
+.DS_Store
+.vscode/
+.idea/
+
+# Coverage
+coverage.out
